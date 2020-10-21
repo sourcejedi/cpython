@@ -267,6 +267,38 @@ class SelectorEventLoopSignalTests(test_utils.TestCase):
         self.assertEqual(len(self.loop._signal_handlers), 0)
         self.assertFalse(m_signal.signal.called)
 
+    def test_wakeup_pipe_overflow(self):
+        # On Linux, we find the self-socket can hold 278 bytes
+        # (when those bytes are written in individual write() calls).
+        # But let us test a bit harder than that.
+        # Since Linux 2.6.11, pipe buffers default to 64K.
+        COUNT_TO=64*1024
+
+        class SignalCounter:
+            def __init__(self):
+                self.n = 0
+
+            def handler(self):
+                self.n += 1
+        usr1 = SignalCounter()
+        usr2 = SignalCounter()
+
+        async def test():
+            loop = asyncio.events.get_running_loop()
+            loop.add_signal_handler(signal.SIGUSR1, usr1.handler)
+            loop.add_signal_handler(signal.SIGUSR2, usr2.handler)
+
+            pid = os.getpid()
+            for i in range(COUNT_TO):
+                os.kill(pid, signal.SIGUSR1)
+            os.kill(pid, signal.SIGUSR2)
+        asyncio.run(test())
+
+        # Note multiple instances of the same signal may be coalesced into 1.
+        self.assertGreater(usr1.n, 0)
+
+        self.assertEqual(usr2.n, 1)
+
 
 @unittest.skipUnless(hasattr(socket, 'AF_UNIX'),
                      'UNIX Sockets are not supported')
