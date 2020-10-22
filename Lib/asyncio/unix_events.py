@@ -1202,51 +1202,16 @@ class FastChildWatcher(BaseChildWatcher):
                 callback(pid, returncode, *args)
 
 
-class MultiLoopChildWatcher(AbstractChildWatcher):
-    """A watcher that doesn't require running loop in the main thread.
-
-    This implementation registers a SIGCHLD signal handler on
-    instantiation (which may conflict with other code that
-    install own handler for this signal).
-
-    The solution is safe but it has a significant overhead when
-    handling a big number of processes (*O(n)* each time a
-    SIGCHLD is received).
-    """
-
-    # Implementation note:
-    # The class keeps compatibility with AbstractChildWatcher ABC
-    # To achieve this it has empty attach_loop() method
-    # and doesn't accept explicit loop argument
-    # for add_child_handler()/remove_child_handler()
-    # but retrieves the current loop by get_running_loop()
-
-    def __init__(self):
+# Internal helper for MultiLoopChildWatcher.
+# Manage the child handlers for a single event loop.
+# So all accesses to this are from the same thread.
+class _LoopChildWatcher:
+    def __init__(self, loop):
+        self._loop = loop
         self._callbacks = {}
-        self._saved_sighandler = None
-
-    def is_active(self):
-        return self._saved_sighandler is not None
-
-    def close(self):
-        self._callbacks.clear()
-        if self._saved_sighandler is not None:
-            handler = signal.getsignal(signal.SIGCHLD)
-            if handler != self._sig_chld:
-                logger.warning("SIGCHLD handler was changed by outside code")
-            else:
-                signal.signal(signal.SIGCHLD, self._saved_sighandler)
-            self._saved_sighandler = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
 
     def add_child_handler(self, pid, callback, *args):
-        loop = events.get_running_loop()
-        self._callbacks[pid] = (loop, callback, args)
+        self._callbacks[pid] = (callback, args)
 
         # Prevent a race condition in case the child is already terminated.
         self._do_waitpid(pid)
@@ -1258,24 +1223,8 @@ class MultiLoopChildWatcher(AbstractChildWatcher):
         except KeyError:
             return False
 
-    def attach_loop(self, loop):
-        # Don't save the loop but initialize itself if called first time
-        # The reason to do it here is that attach_loop() is called from
-        # unix policy only for the main thread.
-        # Main thread is required for subscription on SIGCHLD signal
-        if self._saved_sighandler is None:
-            self._saved_sighandler = signal.signal(signal.SIGCHLD, self._sig_chld)
-            if self._saved_sighandler is None:
-                logger.warning("Previous SIGCHLD handler was set by non-Python code, "
-                               "restore to default handler on watcher close.")
-                self._saved_sighandler = signal.SIG_DFL
-
-            # Set SA_RESTART to limit EINTR occurrences.
-            signal.siginterrupt(signal.SIGCHLD, False)
-
-    def _do_waitpid_all(self):
-        for pid in list(self._callbacks):
-            self._do_waitpid(pid)
+    def empty(self):
+        return not self._callbacks
 
     def _do_waitpid(self, expected_pid):
         assert expected_pid > 0
@@ -1299,28 +1248,112 @@ class MultiLoopChildWatcher(AbstractChildWatcher):
             returncode = _compute_returncode(status)
             debug_log = True
         try:
-            loop, callback, args = self._callbacks.pop(pid)
+            callback, args = self._callbacks.pop(pid)
         except KeyError:  # pragma: no cover
             # May happen if .remove_child_handler() is called
             # after os.waitpid() returns.
             logger.warning("Child watcher got an unexpected pid: %r",
                            pid, exc_info=True)
         else:
-            if loop.is_closed():
-                logger.warning("Loop %r that handles pid %r is closed", loop, pid)
-            else:
-                if debug_log and loop.get_debug():
-                    logger.debug('process %s exited with returncode %s',
-                                 expected_pid, returncode)
-                loop.call_soon_threadsafe(callback, pid, returncode, *args)
+            if debug_log and self._loop.get_debug():
+                logger.debug('process %s exited with returncode %s',
+                                expected_pid, returncode)
+            self._loop.call_soon(callback, pid, returncode, *args)
 
-    def _sig_chld(self, signum, frame):
+    def do_waitpid_all(self):
         try:
-            self._do_waitpid_all()
+            for pid in list(self._callbacks):
+                self._do_waitpid(pid)
         except (SystemExit, KeyboardInterrupt):
             raise
         except BaseException:
-            logger.warning('Unknown exception in SIGCHLD handler', exc_info=True)
+            # self._loop should always be available here
+            # as we are only called via loop.call_soon_threadsafe()
+            self._loop.call_exception_handler({
+                'message': 'Unknown exception in SIGCHLD handler',
+                'exception': exc,
+            })
+
+
+class MultiLoopChildWatcher(AbstractChildWatcher):
+    """A watcher that doesn't require running loop in the main thread.
+
+    This implementation registers a SIGCHLD signal handler on
+    instantiation (which may conflict with other code that
+    install own handler for this signal).
+
+    The solution is safe but it has a significant overhead when
+    handling a big number of processes (*O(n)* each time a
+    SIGCHLD is received).
+    """
+
+    # Implementation note:
+    # The class keeps compatibility with AbstractChildWatcher ABC
+    # To achieve this it has empty attach_loop() method
+    # and doesn't accept explicit loop argument
+    # for add_child_handler()/remove_child_handler()
+    # but retrieves the current loop by get_running_loop()
+
+    def __init__(self):
+        self._loops = {}  # event loop -> _LoopChildWatcher
+        self._saved_sighandler = None
+
+    def is_active(self):
+        return self._saved_sighandler is not None
+
+    def close(self):
+        self._loops.clear()
+        if self._saved_sighandler is not None:
+            handler = signal.getsignal(signal.SIGCHLD)
+            if handler != self._sig_chld:
+                logger.warning("SIGCHLD handler was changed by outside code")
+            else:
+                signal.signal(signal.SIGCHLD, self._saved_sighandler)
+            self._saved_sighandler = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    def add_child_handler(self, pid, callback, *args):
+        loop = events.get_running_loop()
+        if not loop in self._loops:
+            self._loops[loop] = _LoopChildWatcher(loop)
+        watcher = self._loops[loop]
+        watcher.add_child_handler(pid, callback, *args)
+
+    def remove_child_handler(self, pid):
+        if not loop in self._loops:
+            return False
+        watcher = self._loops[loop]
+        ret = watcher.remove_child_handler(pid)
+        if watcher.empty():
+            del self._loops[loop]
+
+    def attach_loop(self, loop):
+        # Don't save the loop but initialize itself if called first time
+        # The reason to do it here is that attach_loop() is called from
+        # unix policy only for the main thread.
+        # Main thread is required for subscription on SIGCHLD signal
+        if self._saved_sighandler is None:
+            self._saved_sighandler = signal.signal(signal.SIGCHLD, self._sig_chld)
+            if self._saved_sighandler is None:
+                logger.warning("Previous SIGCHLD handler was set by non-Python code, "
+                               "restore to default handler on watcher close.")
+                self._saved_sighandler = signal.SIG_DFL
+
+            # Set SA_RESTART to limit EINTR occurrences.
+            signal.siginterrupt(signal.SIGCHLD, False)
+
+    def _sig_chld(self, signum, frame):
+        for loop, watcher in self._loops.items():
+            # TODO - is this good enough? can we do better?
+            if loop.is_closed():
+                logger.warning("Loop %r is closed, but it still had running subprocesses", loop)
+            else:
+                loop.call_soon_threadsafe(watcher.do_waitpid_all)
 
 
 class ThreadedChildWatcher(AbstractChildWatcher):

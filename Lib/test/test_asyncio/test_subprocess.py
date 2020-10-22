@@ -1,6 +1,7 @@
 import os
 import signal
 import sys
+import time
 import unittest
 import warnings
 from unittest import mock
@@ -654,6 +655,24 @@ class SubprocessMixin:
                 )
             await proc.wait()
         self.loop.run_until_complete(go())
+
+    def test_kill_before_wait(self):
+        # Patch os.kill to call sleep(0.1) first,
+        # opening up the window for a race condition.
+        os_kill = os.kill
+        def kill(pid, signum):
+            time.sleep(0.1)
+            os_kill(pid, signum)
+
+        with mock.patch('subprocess.os.kill', kill):
+            async def go():
+                p = await asyncio.create_subprocess_shell("exit 0")
+                try:
+                    p.send_signal(signal.SIGTERM)
+                finally:
+                    # cleanup
+                    await p.wait()
+            self.loop.run_until_complete(go())
 
 
 if sys.platform != 'win32':
